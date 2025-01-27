@@ -1,76 +1,61 @@
-import requests
-from typing import Dict, Any, Optional
-import logging
-import streamlit as st
+from groq import Groq
 from tenacity import retry, stop_after_attempt, wait_exponential
+import logging
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+from config import Config
+load_dotenv()
+
 
 class LLMProcessor:
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError("GROQ API key is required")
-        self.api_key = api_key
-        self.url = "https://api.groq.com/openai/v1/chat/completions"
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
+    def __init__(self, config: Config):
+        if not config.GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is required in the configuration")
+        self.client = Groq(api_key=config.GROQ_API_KEY)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def _make_api_call(self, messages: list, temperature: float = 0.7) -> Optional[str]:
+    def generate_email(self, prompt: str, placeholders: list, temperature: float = 0.7) -> Optional[str]:
         try:
-            response = requests.post(
-                self.url,
-                headers=self.headers,
-                json={
-                    "model": "mixtral-8x7b-32768",
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": 2000
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 429:
-                raise Exception("Rate limit exceeded")
-                
-            response.raise_for_status()
-            return response.json()['choices'][0]['message']['content']
-            
-        except requests.exceptions.Timeout:
-            raise Exception("API request timed out")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"API request failed: {str(e)}")
-
-    def process_content(self, content: str, context: Dict[str, Any]) -> str:
-        try:
-            prompt = [
+            placeholder_str = ", ".join([f"{{{{{placeholder}}}}}" for placeholder in placeholders])
+            messages = [
                 {
                     "role": "system",
-                    "content": "You are a professional email content enhancer. Maintain all personalization variables and HTML formatting while improving the content."
+                    "content": "You are an expert email writer. Create professional emails that incorporate specified placeholder variables."
                 },
                 {
                     "role": "user",
                     "content": f"""
-                    Enhance this email while keeping all personalization variables:
-                    {content}
+                    Generate a professional email based on this prompt:
+                    {prompt}
                     
-                    Context:
-                    Recipient: {context['recipient']}
-                    Variables: {context['variables']}
+                    Include these placeholders: {placeholder_str}
+                    Format placeholders exactly as provided (e.g., {{name}} for name).
                     """
                 }
             ]
 
-            enhanced_content = self._make_api_call(prompt)
-            return enhanced_content if enhanced_content else content
-
+            chat_completion = self.client.chat.completions.create(
+                model="mixtral-8x7b-32768",
+                messages=messages,
+                temperature=temperature,
+                max_tokens=2000
+            )
+            
+            return chat_completion.choices[0].message.content
+            
         except Exception as e:
-            logging.error(f"Content processing error: {str(e)}")
-            return content
+            logging.error(f"Email generation failed: {e}")
+            return None
 
-    def test_connection(self) -> bool:
+            
+    def process_content(self, email_content: str, context: Dict[str, Any]) -> str:
         try:
-            test_message = [{"role": "user", "content": "Test connection"}]
-            return bool(self._make_api_call(test_message, temperature=0.1))
-        except Exception:
-            return False
+            content_with_placeholders = email_content
+            for key, value in context['variables'].items():
+                content_with_placeholders = content_with_placeholders.replace(f"{{{{{key}}}}}", str(value))
+            return content_with_placeholders
+        except Exception as e:
+            logging.error(f"Content processing failed: {e}")
+            return email_content
+
+
