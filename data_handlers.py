@@ -1,137 +1,117 @@
+import os
+import logging
 from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import pandas as pd
 import streamlit as st
-from pathlib import Path
-import os
-import pickle
 from dotenv import load_dotenv
 from config import Config
 
-# Load environment variables and config
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+
 load_dotenv()
 config = Config.from_env()
 
 class DataHandler:
     SHEETS_SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-    
+
     def __init__(self, config: Config):
         self.config = config
         self.sheets_credentials = None
         self.sheets_service = None
 
-    def connect_google_sheet(self, sheet_url: str) -> pd.DataFrame:
-        """Connect to Google Sheets with proper error handling and authentication."""
+    def validate_google_sheet_url(self, sheet_url: str) -> bool:
+        return 'docs.google.com/spreadsheets/d/' in sheet_url
+
+    def extract_sheet_id(self, sheet_url: str) -> str:
+        return sheet_url.split("/d/")[1].split("/")[0]
+
+    def get_sheets_service(self):
         try:
             sheets_creds_file = self.config.SHEETS_CREDS_FILE
-            
+
             if not os.path.exists(sheets_creds_file):
-                st.error(f"Sheets credentials file not found: {sheets_creds_file}")
-                return pd.DataFrame()
+                raise FileNotFoundError(f"Sheets credentials file not found: {sheets_creds_file}")
 
-            try:
-                self.sheets_credentials = service_account.Credentials.from_service_account_file(
-                    sheets_creds_file,
-                    scopes=self.SHEETS_SCOPES
-                )
-            except Exception as e:
-                st.error(f"Error loading sheets credentials: {str(e)}")
-                return pd.DataFrame()
-
-            try:
-                self.sheets_service = build('sheets', 'v4', credentials=self.sheets_credentials)
-            except Exception as e:
-                st.error(f"Error building sheets service: {str(e)}")
-                return pd.DataFrame()
-
-            if '/d/' not in sheet_url:
-                st.error("Invalid Google Sheets URL. Please use the full URL from your browser.")
-                return pd.DataFrame()
-
-            sheet_id = sheet_url.split("/d/")[1].split("/")[0]
-
-            try:
-                sheet_metadata = self.sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
-                sheets = sheet_metadata.get('sheets', '')
-
-                if not sheets:
-                    st.error("No sheets found in the specified document")
-                    return pd.DataFrame()
-                
-                sheet_name = sheets[0]['properties']['title']
-
-                range_name = f"{sheet_name}!A1:ZZ10000"
-                result = self.sheets_service.spreadsheets().values().get(
-                    spreadsheetId=sheet_id,
-                    range=range_name
-                ).execute()
-
-                values = result.get("values", [])
-                if not values:
-                    st.error("No data found in sheet")
-                    return pd.DataFrame()
-
-                df = pd.DataFrame(values[1:], columns=values[0])
-
-                df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-
-                df = df.dropna(how='all').dropna(axis=1, how='all')
-
-                return df
-
-            except HttpError as e:
-                st.error(f"Google Sheets API error: {str(e)}")
-                return pd.DataFrame()
+            self.sheets_credentials = service_account.Credentials.from_service_account_file(
+                sheets_creds_file,
+                scopes=self.SHEETS_SCOPES
+            )
+            self.sheets_service = build('sheets', 'v4', credentials=self.sheets_credentials)
+            return self.sheets_service
 
         except Exception as e:
+            logging.error(f"Error initializing Google Sheets service: {e}")
+            raise
+
+    def connect_google_sheet(self, sheet_url: str) -> pd.DataFrame:
+        try:
+            if not self.validate_google_sheet_url(sheet_url):
+                raise ValueError("Invalid Google Sheets URL. Please provide a valid URL.")
+
+            sheet_id = self.extract_sheet_id(sheet_url)
+            service = self.get_sheets_service()
+
+            sheet_metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+            sheet_name = sheet_metadata.get('sheets', [{}])[0].get('properties', {}).get('title', 'Sheet1')
+
+            range_name = f"{sheet_name}!A1:ZZ10000"
+            result = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=range_name
+            ).execute()
+
+            values = result.get("values", [])
+            if not values:
+                raise ValueError("No data found in sheet.")
+
+            df = pd.DataFrame(values[1:], columns=values[0])
+            df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+            return df.dropna(how='all').dropna(axis=1, how='all')
+
+        except HttpError as e:
+            logging.error(f"Google Sheets API error: {e}")
+            st.error(f"Google Sheets API error: {str(e)}")
+            return pd.DataFrame()
+        except Exception as e:
+            logging.error(f"Error connecting to Google Sheet: {e}")
             st.error(f"Error connecting to Google Sheet: {str(e)}")
             return pd.DataFrame()
 
     def read_csv(self, file) -> pd.DataFrame:
-        """Read CSV file with error handling."""
         try:
-            df = pd.read_csv(file)
-            return df
+            return pd.read_csv(file)
         except Exception as e:
+            logging.error(f"Error reading CSV file: {e}")
             st.error(f"Error reading CSV file: {str(e)}")
             return pd.DataFrame()
 
     def validate_sheets_credentials(self) -> bool:
-        """Validate Google Sheets credentials file."""
         try:
             sheets_creds_file = self.config.SHEETS_CREDS_FILE
             if not os.path.exists(sheets_creds_file):
-                return False
+                raise FileNotFoundError(f"Sheets credentials file not found: {sheets_creds_file}")
 
-            sheets_credentials = service_account.Credentials.from_service_account_file(
+            credentials = service_account.Credentials.from_service_account_file(
                 sheets_creds_file,
                 scopes=self.SHEETS_SCOPES
             )
-            
-            return sheets_credentials.valid
 
-        except Exception:
+            return credentials.valid
+        except Exception as e:
+            logging.error(f"Error validating Sheets credentials: {e}")
             return False
 
     def check_sheets_access(self) -> bool:
-        """Check if we have valid access to Google Sheets API."""
         try:
             if not self.validate_sheets_credentials():
-                st.error("Invalid or missing Google Sheets credentials")
-                return False
+                raise ValueError("Invalid or missing Google Sheets credentials.")
 
-            credentials = service_account.Credentials.from_service_account_file(
-                self.config.SHEETS_CREDS_FILE,
-                scopes=self.SHEETS_SCOPES
-            )
-            service = build('sheets', 'v4', credentials=credentials)
-            
+            self.get_sheets_service()
             return True
 
         except Exception as e:
-            st.error(f"Error checking Google Sheets access: {str(e)}")
+            logging.error(f"Error checking Sheets access: {e}")
+            st.error(f"Error checking Sheets access: {str(e)}")
             return False
